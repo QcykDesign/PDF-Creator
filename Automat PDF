@@ -1,0 +1,18 @@
+import fitz  # PyMuPDF: pip install pymupdf
+
+pdf_path = "wejscie.pdf"
+logo_path = "logo.png"
+output_path = "wyjscie_z_logo.pdf"
+
+# współrzędne w punktach PDF (0,0 to dół strony)
+x, y = 100, 200  # tu wkleimy logo
+logo_width, logo_height = 120, 60  # rozmiar logo
+
+doc = fitz.open(pdf_path)
+
+for page in doc:
+    rect = fitz.Rect(x, y, x + logo_width, y + logo_height)
+    page.insert_image(rect, filename=logo_path)
+
+doc.save(output_path)
+doc.close()
