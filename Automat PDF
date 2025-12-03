@@ -1,18 +1,324 @@
-import fitz  # PyMuPDF: pip install pymupdf
+import io
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Tuple, Optional
 
-pdf_path = "wejscie.pdf"
-logo_path = "logo.png"
-output_path = "wyjscie_z_logo.pdf"
+import fitz  # PyMuPDF
+from PIL import Image, ImageTk
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
-# współrzędne w punktach PDF (0,0 to dół strony)
-x, y = 100, 200  # tu wkleimy logo
-logo_width, logo_height = 120, 60  # rozmiar logo
+# ========= KONFIGURACJA SZABLONU =========
 
-doc = fitz.open(pdf_path)
+# Nazwa pliku PDF z krzyżykami (musi leżeć w tym samym katalogu co skrypt)
+TEMPLATE_PDF = "znaczniki.pdf"
 
-for page in doc:
-    rect = fitz.Rect(x, y, x + logo_width, y + logo_height)
-    page.insert_image(rect, filename=logo_path)
+# Stałe współrzędne (w punktach PDF) wyznaczone na podstawie pliku "znaczniki.pdf".
+# Układ współrzędnych PyMuPDF: (0,0) w lewym górnym rogu strony, wartości rosną w dół i w prawo.
+# 1 = zielony krzyżyk, 2 = czerwony, 3 = żółty.
+MARKER_POSITIONS: Dict[int, Tuple[float, float]] = {
+    1: (821.84, 311.88),   # zielony
+    2: (1153.78, 527.79),  # czerwony
+    3: (820.84, 1063.58),  # żółty
+}
 
-doc.save(output_path)
-doc.close()
+PT_PER_MM = 72.0 / 25.4  # przelicznik mm -> punkty PDF
+
+
+@dataclass
+class LogoSlotState:
+    index: int
+    color_name: str
+    marker_xy: Tuple[float, float]
+    file_path: Optional[Path] = None
+    width_mm: float = 0.0
+
+
+class PdfLogoApp:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Wstawianie logotypów do znaczniki.pdf")
+
+        self.template_path = Path(TEMPLATE_PDF)
+        if not self.template_path.exists():
+            messagebox.showerror("Błąd", f"Nie znaleziono pliku szablonu: {self.template_path}")
+            raise SystemExit(1)
+
+        # Stan 3 slotów
+        self.slots: Dict[int, LogoSlotState] = {
+            1: LogoSlotState(1, "zielony krzyżyk (pozycja 1)", MARKER_POSITIONS[1]),
+            2: LogoSlotState(2, "czerwony krzyżyk (pozycja 2)", MARKER_POSITIONS[2]),
+            3: LogoSlotState(3, "żółty krzyżyk (pozycja 3)", MARKER_POSITIONS[3]),
+        }
+
+        # UI
+        self._build_ui()
+
+        # załaduj podgląd szablonu
+        self.update_preview_from_pdf(self.template_path)
+
+    # ========= UI =========
+
+    def _build_ui(self):
+        self.root.geometry("1200x900")
+
+        main_frame = ttk.Frame(self.root)
+        main_frame.pack(fill="both", expand=True)
+
+        # Lewa część: podgląd PDF
+        preview_frame = ttk.Frame(main_frame)
+        preview_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+        self.preview_label = ttk.Label(preview_frame)
+        self.preview_label.pack(fill="both", expand=True)
+
+        # Prawa część: panele logo
+        side_frame = ttk.Frame(main_frame)
+        side_frame.pack(side="right", fill="y", padx=10, pady=10)
+
+        self.slot_file_labels: Dict[int, tk.StringVar] = {}
+        self.slot_width_vars: Dict[int, tk.StringVar] = {}
+
+        for idx in (1, 2, 3):
+            slot = self.slots[idx]
+            frame = ttk.LabelFrame(side_frame, text=f"Logo {slot.index} – {slot.color_name}")
+            frame.pack(fill="x", pady=5)
+
+            # przycisk wyboru pliku
+            btn = ttk.Button(frame, text="Wybierz plik (PDF/EPS/SVG/JPG/PNG)",
+                             command=lambda i=idx: self.choose_file(i))
+            btn.pack(fill="x", pady=3)
+
+            # etykieta z nazwą wybranego pliku
+            file_var = tk.StringVar(value="Brak pliku")
+            self.slot_file_labels[idx] = file_var
+            file_label = ttk.Label(frame, textvariable=file_var, wraplength=260)
+            file_label.pack(fill="x", pady=2)
+
+            # pole z szerokością
+            width_frame = ttk.Frame(frame)
+            width_frame.pack(fill="x", pady=3)
+
+            ttk.Label(width_frame, text="Szerokość logotypu [mm]:").pack(side="left")
+            width_var = tk.StringVar(value="30")  # domyślnie 30 mm
+            self.slot_width_vars[idx] = width_var
+            width_entry = ttk.Entry(width_frame, textvariable=width_var, width=6)
+            width_entry.pack(side="left", padx=5)
+
+        # przycisk zapisu
+        save_btn = ttk.Button(side_frame, text="Zapisz jako PDF...", command=self.save_with_logos)
+        save_btn.pack(fill="x", pady=15)
+
+        # info
+        info_label = ttk.Label(
+            side_frame,
+            text=(
+                "Instrukcja:\n"
+                "1. Upewnij się, że plik 'znaczniki.pdf' leży obok tego programu.\n"
+                "2. Wybierz grafiki dla poszczególnych pozycji.\n"
+                "3. Podaj szerokość w mm (wysokość przeliczy się proporcjonalnie).\n"
+                "4. Kliknij 'Zapisz jako PDF...'."
+            ),
+            wraplength=260,
+            justify="left",
+        )
+        info_label.pack(fill="x", pady=10)
+
+    # ========= Funkcje UI =========
+
+    def choose_file(self, slot_index: int):
+        filetypes = [
+            ("Pliki graficzne", "*.pdf *.eps *.svg *.jpg *.jpeg *.png"),
+            ("Wszystkie pliki", "*.*"),
+        ]
+        path_str = filedialog.askopenfilename(
+            title=f"Wybierz plik dla logo {slot_index}",
+            filetypes=filetypes,
+        )
+        if not path_str:
+            return
+
+        path = Path(path_str)
+        self.slots[slot_index].file_path = path
+        self.slot_file_labels[slot_index].set(path.name)
+
+    # ========= Przetwarzanie PDF =========
+
+    def save_with_logos(self):
+        # sprawdź, czy jest przynajmniej jedno logo
+        if not any(slot.file_path for slot in self.slots.values()):
+            messagebox.showwarning("Brak danych", "Nie wybrano żadnego pliku logotypu.")
+            return
+
+        # pobierz ścieżkę do pliku wynikowego
+        out_path_str = filedialog.asksaveasfilename(
+            title="Zapisz z logotypami jako...",
+            defaultextension=".pdf",
+            filetypes=[("PDF", "*.pdf")],
+        )
+        if not out_path_str:
+            return
+
+        out_path = Path(out_path_str)
+
+        try:
+            doc = fitz.open(str(self.template_path))
+        except Exception as e:
+            messagebox.showerror("Błąd", f"Nie udało się otworzyć szablonu PDF:\n{e}")
+            return
+
+        try:
+            page = doc[0]  # zakładamy 1 stronę; jeśli więcej, można rozszerzyć
+
+            for idx, slot in self.slots.items():
+                if not slot.file_path:
+                    continue
+
+                # odczytaj szerokość w mm
+                width_str = self.slot_width_vars[idx].get().strip()
+                try:
+                    width_mm = float(width_str.replace(",", "."))
+                    if width_mm <= 0:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror(
+                        "Błędna szerokość",
+                        f"Nieprawidłowa szerokość dla logo {idx}: '{width_str}'. "
+                        f"Podaj dodatnią liczbę.",
+                    )
+                    doc.close()
+                    return
+
+                try:
+                    img_bytes, img_w_px, img_h_px = self.load_image_as_png_bytes(slot.file_path)
+                except Exception as e:
+                    messagebox.showerror(
+                        "Błąd wczytywania grafiki",
+                        f"Nie udało się wczytać pliku '{slot.file_path}':\n{e}",
+                    )
+                    doc.close()
+                    return
+
+                aspect = img_h_px / img_w_px
+                width_pt = width_mm * PT_PER_MM
+                height_pt = width_pt * aspect
+
+                cx, cy = slot.marker_xy
+                x1 = cx - width_pt / 2
+                y1 = cy - height_pt / 2
+                x2 = cx + width_pt / 2
+                y2 = cy + height_pt / 2
+
+                rect = fitz.Rect(x1, y1, x2, y2)
+                page.insert_image(rect, stream=img_bytes)
+
+            # zapis PDF
+            doc.save(str(out_path))
+
+            # odśwież podgląd na podstawie właśnie zapisanego pliku
+            self.update_preview_from_pdf(out_path)
+
+            messagebox.showinfo("Gotowe", f"Zapisano plik:\n{out_path}")
+        finally:
+            doc.close()
+
+    def load_image_as_png_bytes(self, path: Path):
+        """
+        Wczytuje obraz w różnych formatach i zwraca:
+        (bytes_png, width_px, height_px)
+
+        Obsługiwane:
+        - PNG, JPG, JPEG (bezpośrednio przez Pillow)
+        - PDF (pierwsza strona, rasteryzowana przez PyMuPDF)
+        - SVG (przez cairosvg, jeśli zainstalowane)
+        - EPS (przez Pillow + Ghostscript, jeśli dostępne)
+        """
+        ext = path.suffix.lower()
+
+        if ext in {".png", ".jpg", ".jpeg"}:
+            img = Image.open(path)
+            img = img.convert("RGBA")
+            w, h = img.size
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue(), w, h
+
+        if ext == ".pdf":
+            doc = fitz.open(str(path))
+            try:
+                page = doc[0]
+                # rasteryzacja w wyższej rozdzielczości (np. 300 dpi)
+                zoom = 300 / 72.0
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat)
+                w, h = pix.width, pix.height
+                png_bytes = pix.tobytes("png")
+                return png_bytes, w, h
+            finally:
+                doc.close()
+
+        if ext == ".svg":
+            try:
+                import cairosvg
+            except ImportError as e:
+                raise RuntimeError(
+                    "Obsługa SVG wymaga zainstalowania biblioteki 'cairosvg' "
+                    "(pip install cairosvg)"
+                ) from e
+            png_bytes = cairosvg.svg2png(url=str(path))
+            img = Image.open(io.BytesIO(png_bytes))
+            w, h = img.size
+            return png_bytes, w, h
+
+        if ext == ".eps":
+            # Pillow potrafi obsłużyć EPS, jeżeli w systemie jest Ghostscript.
+            img = Image.open(path)
+            img = img.convert("RGBA")
+            w, h = img.size
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue(), w, h
+
+        raise ValueError(f"Nieobsługiwany format pliku: {ext}")
+
+    # ========= Podgląd PDF =========
+
+    def update_preview_from_pdf(self, pdf_path: Path):
+        """Renderuje pierwszą stronę PDF i wyświetla w oknie."""
+        try:
+            doc = fitz.open(str(pdf_path))
+            page = doc[0]
+            pix = page.get_pixmap(dpi=120)
+        except Exception as e:
+            messagebox.showerror("Błąd podglądu", f"Nie udało się wygenerować podglądu:\n{e}")
+            return
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+        mode = "RGBA" if pix.alpha else "RGB"
+        img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+        # skalowanie, żeby zmieścić się w oknie
+        max_w, max_h = 800, 850
+        scale = min(max_w / img.width, max_h / img.height, 1.0)
+        if scale < 1.0:
+            new_size = (int(img.width * scale), int(img.height * scale))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        self.preview_photo = ImageTk.PhotoImage(img)
+        self.preview_label.configure(image=self.preview_photo)
+
+
+def main():
+    root = tk.Tk()
+    app = PdfLogoApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
